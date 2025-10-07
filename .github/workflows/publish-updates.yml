@@ -1,40 +1,58 @@
-
-name: Publish updates & manifest (multi-dir, zip or files)
+name: Publish updates & manifest (Sigla/<Subpasta>/<versão>)
 
 on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (ex.: v10.06)'
+        required: false
+        type: string
 
 permissions:
   contents: write
 
 env:
-  DEFAULT_MODULE: Escala
+  # Raiz do cliente
+  DEFAULT_MODULE: Sigla
+  # Subpastas válidas (como existem no cliente)
+  SUBMODULES: Escala,Coordenacao,Usuarios,Balanceamento
+  # Mínimo suportado
   MIN_SUPPORTED: ${{ vars.MIN_SUPPORTED || '2.3.0' }}
+  # Domínio de updates
   UPDATE_BASE: https://update.sigla.app
-  MODULES: Escala,coordenacao,usuarios,balanceamento
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout updates repo
+      - name: Checkout updates repo (main)
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Resolve tag -> version
         id: ver
+        shell: bash
         run: |
-          TAG="${{ github.event.release.tag_name || github.ref_name }}"
-          VER="${TAG#v}"
+          RAW="${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
+          TAG="${RAW##*/}"          # tira refs/tags/
+          VER="${TAG#v}"            # remove prefixo v
+          # saneia: remove espaços e qq char fora de 0-9 A-Z a-z . _ -
+          VER="$(echo "$VER" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[^0-9A-Za-z._-]//g')"
+          VER="${VER#.}"            # remove ponto inicial acidental
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "Versão normalizada: $VER"
 
       - name: Install unzip & GitHub CLI
         run: |
           sudo apt-get update -y
           sudo apt-get install -y unzip
-          echo "Done."
+          echo "Tools ready."
+
       - name: Download release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -42,16 +60,20 @@ jobs:
           rm -rf dist && mkdir -p dist
           gh release download "${{ steps.ver.outputs.tag }}" --dir dist --repo "${{ github.repository }}"
           echo "Assets:"
-          ls -R dist || true
+          ls -la dist || true
 
-      - name: Route assets (prefix) and extract ZIPs
+      - name: Route assets (ZIPs/prefixos) para Sigla/<Subpasta>/<versão> + SHA256
         id: route
+        shell: bash
         run: |
           set -e
+          ROOT="${{ env.DEFAULT_MODULE }}"
           VER="${{ steps.ver.outputs.version }}"
-          IFS=',' read -r -a MODS <<< "${{ env.MODULES }}"
-          declare -A VALID
-          for m in "${MODS[@]}"; do VALID["$m"]=1; done
+          IFS=',' read -r -a SUBS <<< "${{ env.SUBMODULES }}"
+
+          # Mapa de subpastas válidas com forma canônica (respeita maiúsculas)
+          declare -A CANON
+          for s in "${SUBS[@]}"; do CANON["${s,,}"]="$s"; done
 
           echo "files<<EOF" >> $GITHUB_OUTPUT
 
@@ -59,63 +81,88 @@ jobs:
           for f in dist/*; do
             base="$(basename "$f")"
             low="${base,,}"
+
+            # --- Detecta subpasta pelo nome do asset ---
+            sub=""
+            if [[ "$low" == escala*.zip || "$low" == siglaesc*.zip || "$low" == escala__* ]]; then sub="Escala"; fi
+            if [[ "$low" == coordenacao*.zip || "$low" == siglacoord*.zip || "$low" == coordenacao__* ]]; then sub="Coordenacao"; fi
+            if [[ "$low" == usuarios*.zip || "$low" == siglausu*.zip || "$low" == usuarios__* ]]; then sub="Usuarios"; fi
+            if [[ "$low" == balanceamento*.zip || "$low" == siglabal*.zip || "$low" == balanceamento__* ]]; then sub="Balanceamento"; fi
+
             if [[ "$low" == *.zip ]]; then
-              # ZIP mode: <module>.zip
-              module="${base%.*}"
-              module="${module,,}"
-              [[ "$module" == "escala" ]] && module="Escala"
-              if [[ -z "${VALID[$module]}" ]]; then
-                echo "ZIP '$base' -> módulo não listado, usando default ${{ env.DEFAULT_MODULE }}"
-                module="${{ env.DEFAULT_MODULE }}"
+              # ===== ZIP =====
+              # se não detectou, não avança (precisamos saber em qual subpasta entrar)
+              if [[ -z "$sub" ]]; then
+                echo "ZIP '$base' sem subpasta reconhecida (Escala/Coordenacao/Usuarios/Balanceamento). Abort."
+                exit 1
               fi
-              tmpdir="_unzip_${module}_$RANDOM"
+
+              tmpdir="_unzip_${sub}_$RANDOM"
               mkdir -p "$tmpdir"
               unzip -qq "$f" -d "$tmpdir"
+
               while IFS= read -r -d '' item; do
-                rel="${item#$tmpdir/}"
                 [[ -d "$item" ]] && continue
-                target_dir="$module/$VER/$(dirname "$rel")"
+                rel="${item#$tmpdir/}"
+
+                # remove raiz redundante dentro do ZIP (Sigla/ ou a própria subpasta)
+                first="$(echo "$rel" | cut -d/ -f1)"
+                first_low="${first,,}"
+                if [[ "$first_low" == "sigla" ]]; then rel="${rel#*/}"; fi
+                if [[ "$first_low" == "${sub,,}" ]]; then rel="${rel#*/}"; fi
+
+                subdir="$(dirname "$rel")"
+                [[ "$subdir" == "." ]] && subdir=""
+                target_dir="$ROOT/$sub/$VER/$subdir"
                 mkdir -p "$target_dir"
                 mv "$item" "$target_dir/$(basename "$rel")"
+
                 size=$(stat -c%s "$target_dir/$(basename "$rel")")
                 sha=$(sha256sum "$target_dir/$(basename "$rel")" | awk '{print toupper($1)}')
-                echo "$module|$rel|$size|$sha" >> $GITHUB_OUTPUT
+                # Guardamos: ROOT|SUB|REL|SIZE|SHA
+                echo "$ROOT|$sub|$rel|$size|$sha" >> $GITHUB_OUTPUT
               done < <(find "$tmpdir" -type f -print0)
               rm -rf "$tmpdir"
+
             else
-              # Prefix mode: <module>__<filename> OR default module
-              module="${{ env.DEFAULT_MODULE }}"
+              # ===== Arquivo com prefixo opcional: <Subpasta>__arquivo.ext =====
               name="$base"
               if [[ "$base" == *"__"* ]]; then
-                module="${base%%__*}"
+                maybe_sub="${base%%__*}"
                 name="${base#*__}"
+                sub="${CANON[${maybe_sub,,}]}"
               fi
-              module="${module,,}"
-              [[ "$module" == "escala" ]] && module="Escala"
-              if [[ -z "${VALID[$module]}" ]]; then
-                echo "Arquivo '$base' -> módulo não listado, usando default ${{ env.DEFAULT_MODULE }}"
-                module="${{ env.DEFAULT_MODULE }}"
+              # fallback: se não teve prefixo reconhecido, ERRO (precisamos saber a subpasta)
+              if [[ -z "$sub" ]]; then
+                echo "Arquivo '$base' sem prefixo de subpasta (Ex.: Escala__SiglaEsc.exe). Abort."
+                exit 1
               fi
-              target_dir="$module/$VER"
+
+              target_dir="$ROOT/$sub/$VER"
               mkdir -p "$target_dir"
               mv "$f" "$target_dir/$name"
+
               size=$(stat -c%s "$target_dir/$name")
               sha=$(sha256sum "$target_dir/$name" | awk '{print toupper($1)}')
-              echo "$module|$name|$size|$sha" >> $GITHUB_OUTPUT
+              echo "$ROOT|$sub|$name|$size|$sha" >> $GITHUB_OUTPUT
             fi
           done
           echo "EOF" >> $GITHUB_OUTPUT
 
+          rm -rf dist
+
       - name: Commit & push versioned files
+        shell: bash
         run: |
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
           git add -A
-          git commit -m "Publish multi-dir ${{ steps.ver.outputs.version }}" || echo "No changes"
-          git push
+          git commit -m "Publish Sigla multi-dir ${{ steps.ver.outputs.version }}" || echo "No changes"
+          git push origin HEAD:main
 
       - name: Generate manifest.xml & latest.json
         id: manifest
+        shell: bash
         run: |
           VER="${{ steps.ver.outputs.version }}"
           DATE="$(date +%Y-%m-%d)"
@@ -130,25 +177,27 @@ jobs:
             echo "  <release_date>${DATE}</release_date>"
             echo "  <notes>Release ${VER}</notes>"
             echo "  <files>"
-            while IFS='|' read -r MODULE REL SIZE SHA; do
-              [ -z "$MODULE" ] && continue
+            while IFS='|' read -r ROOT SUB REL SIZE SHA; do
+              [ -z "$ROOT" ] && continue
               REL_CLEAN="${REL#./}"
               echo "    <file>"
-              echo "      <path>${MODULE}/${REL_CLEAN}</path>"
+              echo "      <path>${ROOT}/${SUB}/${REL_CLEAN}</path>"
               echo "      <size>${SIZE}</size>"
               echo "      <sha256>${SHA}</sha256>"
-              echo "      <url>${BASE}/${MODULE}/${VER}/${REL_CLEAN}</url>"
+              echo "      <url>${BASE}/${ROOT}/${SUB}/${VER}/${REL_CLEAN}</url>"
               echo "    </file>"
             done < <(echo "${{ steps.route.outputs.files }}")
             echo "  </files>"
             echo "</update>"
           } > /tmp/manifest.xml
+
           printf '{ "app":"%s", "version":"%s", "release_date":"%s" }\n' "Sigla" "$VER" "$DATE" > /tmp/latest.json
 
       - name: Push manifest to manifesto repo
         env:
           GH_TOKEN: ${{ secrets.MANIFEST_REPO_TOKEN }}
           MANIFEST_REPO: ${{ secrets.MANIFEST_REPO }}
+        shell: bash
         run: |
           git clone "https://oauth2:${GH_TOKEN}@github.com/${MANIFEST_REPO}.git" _manifest
           cd _manifest
