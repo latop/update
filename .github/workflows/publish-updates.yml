@@ -1,0 +1,162 @@
+
+name: Publish updates & manifest (multi-dir, zip or files)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DEFAULT_MODULE: Escala
+  MIN_SUPPORTED: ${{ vars.MIN_SUPPORTED || '2.3.0' }}
+  UPDATE_BASE: https://update.sigla.app
+  MODULES: Escala,coordenacao,usuarios,balanceamento
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout updates repo
+        uses: actions/checkout@v4
+
+      - name: Resolve tag -> version
+        id: ver
+        run: |
+          TAG="${{ github.event.release.tag_name || github.ref_name }}"
+          VER="${TAG#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VER" >> $GITHUB_OUTPUT
+
+      - name: Install unzip & GitHub CLI
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y unzip
+          echo "Done."
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf dist && mkdir -p dist
+          gh release download "${{ steps.ver.outputs.tag }}" --dir dist --repo "${{ github.repository }}"
+          echo "Assets:"
+          ls -R dist || true
+
+      - name: Route assets (prefix) and extract ZIPs
+        id: route
+        run: |
+          set -e
+          VER="${{ steps.ver.outputs.version }}"
+          IFS=',' read -r -a MODS <<< "${{ env.MODULES }}"
+          declare -A VALID
+          for m in "${MODS[@]}"; do VALID["$m"]=1; done
+
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+
+          shopt -s nullglob
+          for f in dist/*; do
+            base="$(basename "$f")"
+            low="${base,,}"
+            if [[ "$low" == *.zip ]]; then
+              # ZIP mode: <module>.zip
+              module="${base%.*}"
+              module="${module,,}"
+              [[ "$module" == "escala" ]] && module="Escala"
+              if [[ -z "${VALID[$module]}" ]]; then
+                echo "ZIP '$base' -> módulo não listado, usando default ${{ env.DEFAULT_MODULE }}"
+                module="${{ env.DEFAULT_MODULE }}"
+              fi
+              tmpdir="_unzip_${module}_$RANDOM"
+              mkdir -p "$tmpdir"
+              unzip -qq "$f" -d "$tmpdir"
+              while IFS= read -r -d '' item; do
+                rel="${item#$tmpdir/}"
+                [[ -d "$item" ]] && continue
+                target_dir="$module/$VER/$(dirname "$rel")"
+                mkdir -p "$target_dir"
+                mv "$item" "$target_dir/$(basename "$rel")"
+                size=$(stat -c%s "$target_dir/$(basename "$rel")")
+                sha=$(sha256sum "$target_dir/$(basename "$rel")" | awk '{print toupper($1)}')
+                echo "$module|$rel|$size|$sha" >> $GITHUB_OUTPUT
+              done < <(find "$tmpdir" -type f -print0)
+              rm -rf "$tmpdir"
+            else
+              # Prefix mode: <module>__<filename> OR default module
+              module="${{ env.DEFAULT_MODULE }}"
+              name="$base"
+              if [[ "$base" == *"__"* ]]; then
+                module="${base%%__*}"
+                name="${base#*__}"
+              fi
+              module="${module,,}"
+              [[ "$module" == "escala" ]] && module="Escala"
+              if [[ -z "${VALID[$module]}" ]]; then
+                echo "Arquivo '$base' -> módulo não listado, usando default ${{ env.DEFAULT_MODULE }}"
+                module="${{ env.DEFAULT_MODULE }}"
+              fi
+              target_dir="$module/$VER"
+              mkdir -p "$target_dir"
+              mv "$f" "$target_dir/$name"
+              size=$(stat -c%s "$target_dir/$name")
+              sha=$(sha256sum "$target_dir/$name" | awk '{print toupper($1)}')
+              echo "$module|$name|$size|$sha" >> $GITHUB_OUTPUT
+            fi
+          done
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Commit & push versioned files
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "Publish multi-dir ${{ steps.ver.outputs.version }}" || echo "No changes"
+          git push
+
+      - name: Generate manifest.xml & latest.json
+        id: manifest
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          DATE="$(date +%Y-%m-%d)"
+          MIN="${{ env.MIN_SUPPORTED }}"
+          BASE="${{ env.UPDATE_BASE }}"
+          {
+            echo '<?xml version="1.0" encoding="utf-8"?>'
+            echo '<update>'
+            echo '  <app>Sigla</app>'
+            echo "  <version>${VER}</version>"
+            echo "  <min_supported>${MIN}</min_supported>"
+            echo "  <release_date>${DATE}</release_date>"
+            echo "  <notes>Release ${VER}</notes>"
+            echo "  <files>"
+            while IFS='|' read -r MODULE REL SIZE SHA; do
+              [ -z "$MODULE" ] && continue
+              REL_CLEAN="${REL#./}"
+              echo "    <file>"
+              echo "      <path>${MODULE}/${REL_CLEAN}</path>"
+              echo "      <size>${SIZE}</size>"
+              echo "      <sha256>${SHA}</sha256>"
+              echo "      <url>${BASE}/${MODULE}/${VER}/${REL_CLEAN}</url>"
+              echo "    </file>"
+            done < <(echo "${{ steps.route.outputs.files }}")
+            echo "  </files>"
+            echo "</update>"
+          } > /tmp/manifest.xml
+          printf '{ "app":"%s", "version":"%s", "release_date":"%s" }\n' "Sigla" "$VER" "$DATE" > /tmp/latest.json
+
+      - name: Push manifest to manifesto repo
+        env:
+          GH_TOKEN: ${{ secrets.MANIFEST_REPO_TOKEN }}
+          MANIFEST_REPO: ${{ secrets.MANIFEST_REPO }}
+        run: |
+          git clone "https://oauth2:${GH_TOKEN}@github.com/${MANIFEST_REPO}.git" _manifest
+          cd _manifest
+          [ -f .nojekyll ] || touch .nojekyll
+          cp /tmp/manifest.xml ./manifest.xml
+          cp /tmp/latest.json ./latest.json
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add manifest.xml latest.json .nojekyll
+          git commit -m "Update manifest to ${{ steps.ver.outputs.version }}" || echo "No changes"
+          git push
